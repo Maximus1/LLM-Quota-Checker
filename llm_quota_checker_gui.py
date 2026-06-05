@@ -50,26 +50,51 @@ def new_account_id() -> str:
 
 
 def provider_name_from_url(url: str) -> str:
-    """Leitet einen lesbaren Provider-Namen aus der URL ab."""
-    import re
-    m = re.search(r"https?://(?:api\.)?([^./]+)", url.lower())
-    if m:
-        known = {
-            "cline":      "Cline",
-            "openrouter": "OpenRouter",
-            "nvidia":     "NVIDIA",
-            "openai":     "OpenAI",
-            "anthropic":  "Anthropic",
-            "google":     "Google",
-            "together":   "Together AI",
-            "groq":       "Groq",
-        }
-        host_part = m.group(1)
-        for key, label in known.items():
-            if key in host_part:
-                return label
-        return host_part.capitalize()
-    return "API"
+    """Leitet einen lesbaren Provider-Namen aus der URL ab.
+    Nutzt urllib.parse fuer sicheres Hostname-Parsing.
+    """
+    from urllib.parse import urlparse
+    try:
+        parsed = urlparse(url)
+        host   = parsed.hostname or ""
+        port   = parsed.port
+    except Exception:
+        return "API"
+
+    def host_matches(domain: str) -> bool:
+        return host == domain or host.endswith("." + domain)
+
+    # Lokale Adressen zuerst (Port als Zusatzinfo)
+    if _detect_provider(url) == "local":
+        if port == 1234:
+            return "LM Studio"
+        if port == 11434:
+            return "Ollama"
+        return "Local"
+
+    # Bekannte Cloud-Provider (exakter Domain-Vergleich)
+    KNOWN = [
+        ("cline.bot",       "Cline"),
+        ("openrouter.ai",   "OpenRouter"),
+        ("nvidia.com",      "NVIDIA"),
+        ("openai.com",      "OpenAI"),
+        ("anthropic.com",   "Anthropic"),
+        ("googleapis.com",  "Google"),
+        ("together.ai",     "Together AI"),
+        ("groq.com",        "Groq"),
+        ("mistral.ai",      "Mistral"),
+        ("cohere.com",      "Cohere"),
+        ("deepseek.com",    "DeepSeek"),
+    ]
+    for domain, label in KNOWN:
+        if host_matches(domain):
+            return label
+
+    # Fallback: zweite Subdomain-Ebene als Name
+    parts = host.split(".")
+    if len(parts) >= 2:
+        return parts[-2].capitalize()
+    return host.capitalize() or "API"
 
 
 def ensure_account_ids(accounts: list) -> list:
@@ -165,12 +190,29 @@ def remaining_str(retry_until_iso):
 
 
 
+def _strip_html(text: str) -> str:
+    """Entfernt HTML-Tags aus Fehlermeldungen (z.B. LM Studio HTTP 500)."""
+    import re
+    # Titel aus HTML extrahieren falls vorhanden
+    m = re.search(r"<title>(.*?)</title>", text, re.IGNORECASE | re.DOTALL)
+    if m:
+        return m.group(1).strip()
+    # Alle Tags entfernen
+    clean = re.sub(r"<[^>]+>", " ", text)
+    clean = re.sub(r"\s+", " ", clean).strip()
+    return clean[:150] if clean else text[:150]
+
+
 def _parse_error_body(resp) -> str:
     """Extrahiert die Fehlermeldung aus verschiedenen API-Antwortformaten."""
     try:
         data = resp.json()
     except Exception:
-        return resp.text[:300]
+        text = resp.text[:500]
+        # HTML-Antwort (z.B. LM Studio beim Laden eines Modells)
+        if text.strip().startswith("<"):
+            return _strip_html(text)
+        return text[:300]
 
     # OpenAI-Format: {"error": {"message": "..."}}
     if "error" in data:
@@ -255,12 +297,39 @@ OPENROUTER_MODELS_URL = "https://openrouter.ai/api/v1/models"
 NVIDIA_MODELS_URL = "https://integrate.api.nvidia.com/v1/models"
 
 def _detect_provider(url: str) -> str:
-    """Erkennt den API-Anbieter anhand der URL."""
-    url = url.lower()
-    if "nvidia.com" in url:
+    """Erkennt den API-Anbieter anhand der URL.
+    Verwendet urllib.parse fuer sicheres Hostname-Parsing statt
+    einfacher Substring-Suche (verhindert Spoofing durch URLs wie
+    'evil-nvidia.com' oder 'nvidia.com.attacker.net').
+    """
+    from urllib.parse import urlparse
+    import re
+    try:
+        host = urlparse(url).hostname or ""
+    except Exception:
+        return "generic"
+
+    # Exakter Hostname-Vergleich: domain muss am Ende stehen (oder gleich sein)
+    def host_matches(domain: str) -> bool:
+        return host == domain or host.endswith("." + domain)
+
+    if host_matches("integrate.api.nvidia.com") or host_matches("api.nvidia.com") or host_matches("nvidia.com"):
         return "nvidia"
-    if "openrouter.ai" in url:
+    if host_matches("openrouter.ai"):
         return "openrouter"
+
+    # Lokale Adressen: Loopback + Link-Local + RFC-1918
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return "local"
+    if re.match(r"^127\.\d+\.\d+\.\d+$", host):
+        return "local"
+    if re.match(r"^192\.168\.\d+\.\d+$", host):
+        return "local"
+    if re.match(r"^10\.\d+\.\d+\.\d+$", host):
+        return "local"
+    if re.match(r"^172\.(1[6-9]|2[0-9]|3[01])\.\d+\.\d+$", host):
+        return "local"
+
     return "generic"
 
 
@@ -336,6 +405,59 @@ def fetch_model_list_from_nvidia(api_key: str, log_fn=None) -> list:
     except Exception as e:
         if log_fn:
             log_fn(f"Fehler NVIDIA-Modellliste: {e}", "error")
+        return []
+
+
+def models_url_from(completions_url: str) -> str:
+    """Leitet die /v1/models-URL aus einer Completions-URL ab."""
+    for suffix in ("/chat/completions", "/completions"):
+        if completions_url.endswith(suffix):
+            return completions_url[: -len(suffix)] + "/models"
+    return completions_url.rstrip("/") + "/models"
+
+
+def fetch_model_list_from_local(api_key: str, completions_url: str, log_fn=None) -> list:
+    """
+    Fragt den lokalen /v1/models-Endpoint ab (LM Studio, Ollama, Llamafile, etc.).
+    Gibt nur die tatsaechlich geladenen/installierten Modelle zurueck.
+    Kein Auth erforderlich bei den meisten lokalen Servern.
+    """
+    url = models_url_from(completions_url)
+    if log_fn:
+        log_fn(f"-> Frage lokalen Modell-Endpoint ab: {url}", "info")
+    headers = {"Content-Type": "application/json"}
+    # API-Key nur mitsenden wenn vorhanden (manche lokale Server ignorieren ihn)
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+    try:
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code != 200:
+            body = _parse_error_body(resp)
+            raise RuntimeError(f"HTTP {resp.status_code}: {body[:120]}")
+        data = resp.json()
+        # OpenAI-Format: {"data": [...]}  oder direkt eine Liste
+        raw = data.get("data", data) if isinstance(data, dict) else data
+        models = []
+        for m in raw:
+            mid = m.get("id", "") if isinstance(m, dict) else str(m)
+            if not mid:
+                continue
+            models.append({
+                "id":          mid,
+                "label":       m.get("name", mid) if isinstance(m, dict) else mid,
+                "input_price": 0.0,    # lokal = kostenlos
+                "free":        True,
+                "free_suffix": False,
+                "local":       True,
+            })
+        return sorted(models, key=lambda m: m["id"])
+    except requests.exceptions.ConnectionError:
+        if log_fn:
+            log_fn(f"✖ Kein lokaler Server erreichbar unter {url}", "error")
+        return []
+    except Exception as e:
+        if log_fn:
+            log_fn(f"✖ Fehler beim Laden der lokalen Modellliste: {e}", "error")
         return []
 
 
@@ -478,6 +600,41 @@ class ModelScanDialog(tk.Toplevel):
         self._prog_bar.pack(fill="x", pady=(2, 0))
 
         # ── Container fuer Tabelle + Log ─────────────
+        bot = tk.Frame(self, bg=self.BG_MID, padx=14, pady=8)
+        bot.pack(side="bottom", fill="x")
+
+        self._sum_lbl = tk.Label(bot, text="", bg=self.BG_MID,
+                                  fg=self.FG_DIM, font=("Helvetica", 9))
+        self._sum_lbl.pack(side="left")
+
+        filter_frame = tk.Frame(bot, bg=self.BG_MID)
+        filter_frame.pack(side="left", padx=12)
+
+        self._show_ok      = tk.BooleanVar(value=True)
+        self._show_limited = tk.BooleanVar(value=True)
+        self._show_error   = tk.BooleanVar(value=True)
+
+        for var, text, color in [
+            (self._show_ok,      "✔ Verfügbar", "#22c55e"),
+            (self._show_limited, "✖ Limitiert", "#ef4444"),
+            (self._show_error,   "⚠ Fehler",   "#f59e0b"),
+        ]:
+            tk.Checkbutton(
+                filter_frame, text=text, variable=var,
+                command=self._apply_filter,
+                bg=self.BG_MID, fg=color, selectcolor=self.BG_L,
+                activebackground=self.BG_MID, activeforeground=color,
+                font=("Helvetica", 9), relief="flat", cursor="hand2",
+            ).pack(side="left", padx=4)
+
+        tk.Button(
+            bot, text="＋ Auswahl als Account hinzufügen",
+            command=self._add_selected,
+            bg="#16a34a", fg="white", relief="flat", cursor="hand2",
+            font=("Helvetica", 9, "bold"), padx=10, pady=4,
+        ).pack(side="right")
+
+    # ─────────────────────────── Log-Hilfsmethoden ──
         # Grid-Layout: Tabelle bekommt allen freien Platz, Log fixe Hoehe
         main_frame = tk.Frame(self, bg=self.BG)
         main_frame.pack(fill="both", expand=True, padx=14, pady=(4, 0))
@@ -561,42 +718,7 @@ class ModelScanDialog(tk.Toplevel):
         self._log.tag_configure("info",    foreground="#64748b")
         self._log.tag_configure("head",    foreground="#38bdf8", font=("Consolas", 8, "bold"))
 
-        # ── Unterzeile ────────────────────────────
-        bot = tk.Frame(self, bg=self.BG_MID, padx=14, pady=8)
-        bot.pack(fill="x")
-
-        self._sum_lbl = tk.Label(bot, text="", bg=self.BG_MID,
-                                  fg=self.FG_DIM, font=("Helvetica", 9))
-        self._sum_lbl.pack(side="left")
-
-        filter_frame = tk.Frame(bot, bg=self.BG_MID)
-        filter_frame.pack(side="left", padx=12)
-
-        self._show_ok      = tk.BooleanVar(value=True)
-        self._show_limited = tk.BooleanVar(value=True)
-        self._show_error   = tk.BooleanVar(value=True)
-
-        for var, text, color in [
-            (self._show_ok,      "✔ Verfügbar", "#22c55e"),
-            (self._show_limited, "✖ Limitiert", "#ef4444"),
-            (self._show_error,   "⚠ Fehler",   "#f59e0b"),
-        ]:
-            tk.Checkbutton(
-                filter_frame, text=text, variable=var,
-                command=self._apply_filter,
-                bg=self.BG_MID, fg=color, selectcolor=self.BG_L,
-                activebackground=self.BG_MID, activeforeground=color,
-                font=("Helvetica", 9), relief="flat", cursor="hand2",
-            ).pack(side="left", padx=4)
-
-        tk.Button(
-            bot, text="＋ Auswahl als Account hinzufügen",
-            command=self._add_selected,
-            bg="#16a34a", fg="white", relief="flat", cursor="hand2",
-            font=("Helvetica", 9, "bold"), padx=10, pady=4,
-        ).pack(side="right")
-
-    # ─────────────────────────── Log-Hilfsmethoden ──
+        # ── Unterzeile zuerst packen → bleibt immer sichtbar ─────────
     def _log_write(self, text, tag="info"):
         """Schreibt eine Zeile in die Log-Box (immer im GUI-Thread aufrufen)."""
         self._log.config(state="normal")
@@ -650,14 +772,25 @@ class ModelScanDialog(tk.Toplevel):
         return ids
 
     def _run_scan(self, key, url):
+        try:
+            self._run_scan_inner(key, url)
+        except Exception as e:
+            import traceback
+            self._log_later(f"✖ Unerwarteter Fehler: {e}", "error")
+            self._log_later(traceback.format_exc(), "error")
+            self._finish_scan()
+
+    def _run_scan_inner(self, key, url):
         extra    = self._extra_ids
         provider = _detect_provider(url)
 
         # 1. Passende Modellliste laden
         if provider == "nvidia":
             native_models = fetch_model_list_from_nvidia(key, log_fn=self._log_later)
-            # Zusätzlich OpenRouter-Index für Preis-Lookup
-            or_models = fetch_model_list_from_openrouter(log_fn=None)
+            or_models     = fetch_model_list_from_openrouter(log_fn=None)
+        elif provider == "local":
+            native_models = fetch_model_list_from_local(key, url, log_fn=self._log_later)
+            or_models     = []   # kein OpenRouter-Preis für lokale Modelle
         else:
             native_models = fetch_model_list_from_openrouter(log_fn=self._log_later)
             or_models     = native_models
@@ -682,6 +815,11 @@ class ModelScanDialog(tk.Toplevel):
                 "  ⓘ  NVIDIA: 1.000 kostenlose Inference-Credits nach Anmeldung, danach kostenpflichtig", "info")
             self._log_later(
                 "  ⓘ  429 = Rate Limit (40 Req/Min)  |  402 = Credits erschöpft", "info")
+        elif provider == "local":
+            self._log_later(
+                f"✔ {total} lokale Modelle gefunden  –  alle kostenlos (kein API-Aufruf nötig)", "head")
+            self._log_later(
+                "  ⓘ  Nur lokal installierte Modelle werden angezeigt", "info")
         else:
             gratis = [mid for mid in model_ids if mid in free_ids]
             self._log_later(
@@ -700,7 +838,29 @@ class ModelScanDialog(tk.Toplevel):
             self._finish_scan()
             return
 
-        # 2. Modelle parallel testen
+        # 2a. Lokale Modelle: KEIN Probing – direkt als verfügbar markieren
+        #     LM Studio lädt jedes angefragte Modell in den RAM → gefährlich!
+        if provider == "local":
+            for mid in model_ids:
+                meta   = or_index.get(mid, {"local": True, "free": True,
+                                            "free_suffix": False, "input_price": 0.0})
+                result = {
+                    "model":            mid,
+                    "status":           "ok",
+                    "detail":           "",
+                    "retry_after_secs": 0,
+                    "or_price":         "lokal – kostenlos",
+                    "or_meta":          {**meta, "local": True},
+                    "free_override":    True,
+                }
+                self._results.append(result)
+                self._log_later(f"  ✔ ★  {mid}  (installiert, nicht getestet)", "ok")
+                self.after(0, self._add_row, result)
+            self.after(0, self._set_progress, 100, f"{total} lokale Modelle geladen")
+            self._finish_scan()
+            return
+
+        # 2b. Remote-Modelle: normal proben
         done = 0
         with ThreadPoolExecutor(max_workers=4) as pool:
             futures = {pool.submit(probe_model, key, m, url): m for m in model_ids}
@@ -728,8 +888,6 @@ class ModelScanDialog(tk.Toplevel):
                     line += f"  ({detail})"
                 self._log_later(line, st)
 
-                # Preis-Info aus OpenRouter anhaengen
-                # 402 beweist: kostenpflichtig – OpenRouter-Preis überschreiben
                 if result["status"] == "balance":
                     result["or_price"]      = "kostenpflichtig"
                     result["free_override"] = False
@@ -737,8 +895,9 @@ class ModelScanDialog(tk.Toplevel):
                 else:
                     meta = or_index.get(result["model"])
                     if meta:
-                        if meta["input_price"] < 0:
-                            # NVIDIA: Credits-System
+                        if meta.get("local"):
+                            result["or_price"] = "lokal – kostenlos"
+                        elif meta["input_price"] < 0:
                             result["or_price"] = "Credits erforderlich"
                         elif meta["free_suffix"]:
                             result["or_price"] = "kostenlos (:free)"
@@ -771,12 +930,15 @@ class ModelScanDialog(tk.Toplevel):
         """Fuegt eine Zeile ein. Muss im GUI-Thread laufen."""
         st     = result["status"]
         # ★ nur zeigen wenn: ok UND wirklich kostenlos UND kein 402 bekannt
-        or_meta  = result.get("or_meta", {})
-        is_free  = (result.get("or_price", "") == "kostenlos"
-                    and result.get("free_override", True)
-                    and st == "ok")
+        or_meta     = result.get("or_meta", {})
+        is_local    = or_meta.get("local", False) if isinstance(or_meta, dict) else False
+        is_free     = (result.get("or_price", "") in ("kostenlos", "kostenlos (:free)", "lokal – kostenlos")
+                       and result.get("free_override", True)
+                       and st == "ok")
         free_suffix = or_meta.get("free_suffix", False) if isinstance(or_meta, dict) else False
-        if is_free and free_suffix:
+        if st == "ok" and is_local:
+            label = "✔  Verfügbar  ★"      # lokal = immer kostenlos
+        elif is_free and free_suffix:
             label = "✔  Verfügbar  ★"      # explizit :free
         elif is_free:
             label = "✔  Verfügbar  (~★)"   # $0 aber kein :free-Suffix – unsicher
